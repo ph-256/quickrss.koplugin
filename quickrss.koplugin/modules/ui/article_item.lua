@@ -59,12 +59,11 @@ local ITEM_HEIGHT = PAD + TEXT_COL_H + PAD
 -- ArticleItem
 -- ─────────────────────────────────────────────────────────────────────────────
 local ArticleItem = InputContainer:extend{
-    width         = nil,
-    height        = ITEM_HEIGHT,
-    article       = nil,   -- { title = string, snippet = string }
-    callback      = nil,   -- function(article) called on tap
-    hold_callback = nil,   -- function(article) called on long press
-    art_settings  = nil,   -- optional: pre-fetched Config.getArticleSettings()
+    width        = nil,
+    height       = ITEM_HEIGHT,
+    article      = nil,   -- { title = string, snippet = string }
+    callback     = nil,   -- function(article) called on tap
+    art_settings = nil,   -- optional: pre-fetched Config.getArticleSettings()
 }
 
 function ArticleItem:init()
@@ -76,17 +75,12 @@ function ArticleItem:init()
     self.ges_events.Tap = {
         GestureRange:new{ ges = "tap", range = self.dimen },
     }
-    self.ges_events.Hold = {
-        GestureRange:new{ ges = "hold", range = self.dimen },
-    }
 
     -- ── Dynamic font faces based on card_font_size setting ──────────────────
     local s = self.art_settings
         or require("modules/data/config").getArticleSettings()
     local sz = s.card_font_size
-    local title_face   = self.article.read
-        and Font:getFace("smallinfofont", sz + 1)
-        or  Font:getFace("smallinfofontbold", sz + 1)
+    local title_face   = Font:getFace("smallinfofontbold", sz + 1)
     local snippet_face = Font:getFace("smallinfofont", sz)
     local meta_face    = Font:getFace("smallinfofont", math.max(8, sz - 2))
 
@@ -231,14 +225,7 @@ function ArticleItem:onTap()
     if self.callback then
         self.callback(self.article)
     end
-    return true
-end
-
-function ArticleItem:onHold()
-    if self.hold_callback then
-        self.hold_callback(self.article)
-    end
-    return true
+    return true  -- event consumed; don't propagate
 end
 
 return {
