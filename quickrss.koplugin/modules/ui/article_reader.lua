@@ -14,6 +14,7 @@ local Blitbuffer       = require("ffi/blitbuffer")
 local Button           = require("ui/widget/button")
 local Config           = require("modules/data/config")
 local Device           = require("device")
+local Event            = require("ui/event")
 local FrameContainer   = require("ui/widget/container/framecontainer")
 local Geom             = require("ui/geometry")
 local GestureRange     = require("ui/gesturerange")
@@ -23,10 +24,15 @@ local Images           = require("modules/data/images")
 local ImageViewer      = require("ui/widget/imageviewer")
 local InputContainer   = require("ui/widget/container/inputcontainer")
 local LineWidget       = require("ui/widget/linewidget")
+local ButtonDialog     = require("ui/widget/buttondialog")
+local Font             = require("ui/font")
+local Icons            = require("modules/ui/icons")
+local Notification     = require("ui/widget/notification")
 local QRMessage        = require("ui/widget/qrmessage")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
 local Size             = require("ui/size")
 local TitleBar         = require("ui/widget/titlebar")
+local Translator       = require("ui/translator")
 local UIManager        = require("ui/uimanager")
 local VerticalGroup    = require("ui/widget/verticalgroup")
 local _                = require("gettext")
@@ -88,8 +94,9 @@ local function stripLeadingTitle(html, title)
 end
 
 -- ── CSS ───────────────────────────────────────────────────────────────────────
--- MuPDF does not scale CSS pixel values, so font-size uses pt and spacing
--- uses unitless ratios.  line_spacing is stored as an integer x10 (15 = 1.5).
+-- MuPDF does not DPI-scale CSS pt values, so we must scale font-size ourselves
+-- via Screen:scaleBySize() to match KOReader's native font sizing.
+-- line_spacing is stored as an integer x10 (15 = 1.5).
 -- When the user picks a font file we load it via @font-face so MuPDF uses the
 -- exact file rather than trying to match a family name.
 local function makeCSS(prefs)
@@ -101,16 +108,17 @@ local function makeCSS(prefs)
             prefs.font_file)
         font_family = '"UserFont", serif'
     end
+    local scaled_size = Screen:scaleBySize(prefs.font_size)
     return font_face_rule .. string.format([[
 @page { margin: 0; }
 body {
     margin: 0;
     font-family: %s;
-    font-size: %dpt;
+    font-size: %.1fpt;
     line-height: %.1f;
     text-align: justify;
 }
-.content             { margin: 0 1.5em; padding-top: 0.5em; }
+.content             { margin: 0 1em 0 1.5em; padding-top: 0.5em; }
 p                    { margin: 0.6em 0; }
 h1, h2, h3, h4, h5  { font-weight: bold; margin: 0.8em 0 0.3em; }
 img                  { min-width: 40%% !important; max-width: 100%% !important; height: auto !important; display: block !important; margin: 0.5em auto !important; }
@@ -122,7 +130,7 @@ a                    { text-decoration: underline; }
 .meta                { font-size: 0.85em; margin: 0 0 0.8em; }
 hr                   { border: none; border-top: 1px solid #999999; margin: 0.8em 0 1em; }
 figure               { text-align: center; margin: 0.5em 0; }
-]], font_family, prefs.font_size, prefs.line_spacing / 10)
+]], font_family, scaled_size, prefs.line_spacing / 10)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -130,6 +138,7 @@ local ArticleReader = InputContainer:extend{
     article       = nil,   -- populated by caller
     articles      = nil,   -- optional: full list for prev/next navigation
     article_index = 0,     -- position of `article` within `articles`
+    on_close      = nil,   -- callback when user exits the reader (not on navigate)
 }
 
 function ArticleReader:init()
@@ -141,11 +150,23 @@ function ArticleReader:init()
     }
 
     -- Swipe left/right to navigate between articles
+    local full_range = Geom:new{ x = 0, y = 0, w = screen_w, h = screen_h }
     self.ges_events.Swipe = {
-        GestureRange:new{
-            ges   = "swipe",
-            range = Geom:new{ x = 0, y = 0, w = screen_w, h = screen_h },
-        },
+        GestureRange:new{ ges = "swipe", range = full_range },
+    }
+
+    -- Text selection gestures (propagated to HtmlBoxWidget)
+    self.ges_events.HoldStartText = {
+        GestureRange:new{ ges = "hold", range = full_range },
+    }
+    self.ges_events.HoldPanText = {
+        GestureRange:new{ ges = "hold_pan", range = full_range },
+    }
+    self.ges_events.HoldReleaseText = {
+        GestureRange:new{ ges = "hold_release", range = full_range },
+        args = function(text)
+            self:_showTextMenu(text)
+        end,
     }
 
     self.prefs = Config.getReaderSettings()
@@ -154,12 +175,24 @@ function ArticleReader:init()
         width                  = screen_w,
         title                  = self.article.title or "",
         with_bottom_line       = true,
+        bottom_v_padding       = 0,
         left_icon              = "appbar.settings",
         left_icon_tap_callback = function() self:_openReaderSettings() end,
         close_callback         = function() self:onClose() end,
         show_parent            = self,
     }
     local title_h = title_bar:getSize().h
+
+    -- Make the title text area tappable to show the article context menu.
+    -- Icon buttons (~44px each side) consume their own taps, so we only
+    -- need to handle taps in the middle region of the title bar.
+    local icon_w = Screen:scaleBySize(44)
+    self.ges_events.TapTitle = {
+        GestureRange:new{
+            ges   = "tap",
+            range = Geom:new{ x = icon_w, y = 0, w = screen_w - icon_w * 2, h = title_h },
+        },
+    }
 
     -- ── Prev / Next navigation footer ─────────────────────────────────────────
     local nav_footer_widget = nil
@@ -341,6 +374,7 @@ function ArticleReader:init()
         height                  = self.scroll_h,
         dialog                  = self,
         html_resource_directory = IMAGE_DIR,
+        highlight_text_selection = true,
         html_link_tapped_callback = function(link)
             self:_onLinkTapped(link)
         end,
@@ -369,6 +403,23 @@ function ArticleReader:_openReaderSettings()
     })
 end
 
+function ArticleReader:onTapTitle()
+    local ArticleMenu = require("modules/ui/article_menu")
+    ArticleMenu.show(self.article, self.articles, function()
+        -- If the article was deleted, close the reader
+        local found = false
+        if self.articles then
+            for _, a in ipairs(self.articles) do
+                if a == self.article then found = true; break end
+            end
+        end
+        if not found then
+            self:onClose()
+        end
+    end)
+    return true
+end
+
 function ArticleReader:_applyPrefs(prefs)
     self.prefs = prefs
     self.layout_group[self.scroll_idx] = ScrollHtmlWidget:new{
@@ -378,6 +429,7 @@ function ArticleReader:_applyPrefs(prefs)
         height                  = self.scroll_h,
         dialog                  = self,
         html_resource_directory = IMAGE_DIR,
+        highlight_text_selection = true,
         html_link_tapped_callback = function(link)
             self:_onLinkTapped(link)
         end,
@@ -401,10 +453,90 @@ function ArticleReader:_onLinkTapped(link)
     end
 
     if link.uri:match("^https?://") then
-        UIManager:show(QRMessage:new{
-            text   = link.uri,
-            width  = Screen:getWidth(),
-            height = Screen:getHeight(),
+        self:_showLinkMenu(link.uri)
+    end
+end
+
+function ArticleReader:_showLinkMenu(url)
+    local dialog
+    dialog = ButtonDialog:new{
+        title = url,
+        title_face = Font:getFace("cfont", 14),
+        buttons = {
+            {{ text = Icons.COPY .. "  " .. _("Copy Link"), callback = function()
+                UIManager:close(dialog)
+                Device.input.setClipboardText(url)
+                UIManager:show(Notification:new{
+                    text = _("Link copied to clipboard"),
+                })
+            end }},
+            {{ text = Icons.INFO .. "  " .. _("Show QR Code"), callback = function()
+                UIManager:close(dialog)
+                UIManager:show(QRMessage:new{
+                    text   = url,
+                    width  = Screen:getWidth(),
+                    height = Screen:getHeight(),
+                })
+            end }},
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function ArticleReader:_showTextMenu(text)
+    if not text or text == "" then return end
+    local dialog
+    -- Truncate display title to keep the dialog tidy
+    local display = text
+    if #display > 80 then
+        display = display:sub(1, 77) .. "…"
+    end
+    dialog = ButtonDialog:new{
+        title = display,
+        title_face = Font:getFace("cfont", 14),
+        buttons = {
+            {
+                { text = Icons.COPY .. "  " .. _("Copy"), callback = function()
+                    UIManager:close(dialog)
+                    Device.input.setClipboardText(text)
+                    UIManager:show(Notification:new{
+                        text = _("Copied to clipboard"),
+                    })
+                end },
+                { text = Icons.DICT .. "  " .. _("Dictionary"), callback = function()
+                    UIManager:close(dialog)
+                    self:_lookupText(text)
+                end },
+            },
+            {
+                { text = Icons.TRANSLATE .. "  " .. _("Translate"), callback = function()
+                    UIManager:close(dialog)
+                    Translator:showTranslation(text)
+                end },
+                { text = Icons.QRCODE .. "  " .. _("QR Code"), callback = function()
+                    UIManager:close(dialog)
+                    UIManager:show(QRMessage:new{
+                        text   = text,
+                        width  = Screen:getWidth(),
+                        height = Screen:getHeight(),
+                    })
+                end },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+-- Dispatch dictionary lookup to the active FileManager or ReaderUI instance.
+function ArticleReader:_lookupText(text)
+    local FileManager = require("apps/filemanager/filemanager")
+    local ReaderUI = require("apps/reader/readerui")
+    local ui = ReaderUI.instance or FileManager.instance
+    if ui then
+        ui:handleEvent(Event:new("LookupWord", text))
+    else
+        UIManager:show(Notification:new{
+            text = _("No dictionary available"),
         })
     end
 end
@@ -413,6 +545,9 @@ function ArticleReader:onClose()
     UIManager:close(self)
     -- Full e-ink flash so the feed list underneath redraws without ghosting.
     UIManager:setDirty(nil, "full")
+    if not self._navigating and self.on_close then
+        self.on_close()
+    end
 end
 
 -- Trigger a full e-ink flash on first display to clear ghosting.
@@ -444,11 +579,15 @@ function ArticleReader:_navigateTo(new_idx)
     or new_idx < 1 or new_idx > #self.articles then
         return
     end
+    local target = self.articles[new_idx]
+    target.read = true  -- mark on shared object; saved when user exits reader
+    self._navigating = true  -- suppress on_close callback
     UIManager:close(self)
     UIManager:show(ArticleReader:new{
-        article       = self.articles[new_idx],
+        article       = target,
         articles      = self.articles,
         article_index = new_idx,
+        on_close      = self.on_close,  -- pass through
     })
 end
 

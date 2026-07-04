@@ -102,11 +102,13 @@ local Screen = Device.screen
 --   footer        (prev chevron | "Page N of M" | next chevron)
 -- ─────────────────────────────────────────────────────────────────────────────
 local QuickRSSUI = InputContainer:extend{
-    name        = "quickrss_ui",
-    show_page   = 1,
-    articles    = {},     -- all articles (unfiltered)
-    filtered    = nil,    -- filtered subset, or nil when showing all
-    filter_feed = nil,    -- name of the active feed filter, or nil for all
+    name           = "quickrss_ui",
+    show_page      = 1,
+    articles       = {},     -- all articles (unfiltered)
+    filtered       = nil,    -- filtered subset, or nil when showing all
+    filter_feed    = nil,    -- name of the active feed filter, or nil for all
+    filter_unread  = false,  -- when true, show only unread articles
+    filter_saved   = false,  -- when true, show only saved articles
 }
 
 function QuickRSSUI:init()
@@ -163,19 +165,28 @@ function QuickRSSUI:init()
         face = Font:getFace("cfont", 16),
     }
 
-    local footer_h = self.prev_button:getSize().h + PAD * 2
+    local btn_h = self.prev_button:getSize().h
+    local footer_h = btn_h + PAD * 2
+
+    -- Fixed-width center area so the label stays centred regardless of text length.
+    local max_label = TextWidget:new{
+        text = T(_("Page %1 of %2"), 99, 99),
+        face = Font:getFace("cfont", 16),
+    }
+    local label_area_w = max_label:getSize().w + PAD * 3
+    max_label:free()
 
     self.page_nav = HorizontalGroup:new{
         align = "center",
         self.prev_button,
-        HorizontalSpan:new{ width = PAD * 3 },
-        self.page_label,
-        HorizontalSpan:new{ width = PAD * 3 },
+        CenterContainer:new{
+            dimen = Geom:new{ w = label_area_w, h = btn_h },
+            self.page_label,
+        },
         self.next_button,
     }
 
     -- Footer: filter button left-aligned, page nav right-aligned.
-    -- A flexible spacer pushes them apart.
     local filter_pad = PAD
     local nav_w = self.page_nav:getSize().w
     local filter_w = self.filter_button:getSize().w
@@ -204,15 +215,11 @@ function QuickRSSUI:init()
     self.list_spacer = VerticalSpan:new{ width = 0 }
 
     -- Populated and cleared by _populateItems() on every page turn
-    self.article_list = VerticalGroup:new{ 
-        align = "left", 
-        is_input = true, -- Allows gestures to pass into the list array
-    }
+    self.article_list = VerticalGroup:new{ align = "left" }
 
-    -- Outer frame: white canvas covering the whole screen
+    -- ── Outer frame: white canvas covering the whole screen ──────────────────
     self.outer_group = VerticalGroup:new{
         align = "left",
-        is_input = true, -- Allows gestures to pass from the main frame down
         self.title_bar,
         self.article_list,
         self.list_spacer,
@@ -372,6 +379,31 @@ function QuickRSSUI:_fetch()
             if #articles == 0 then
                 self:_showStatus(_("No articles found.\nCheck your feeds."))
             else
+                -- Preserve read and saved state from old articles
+                local old_read  = {}
+                local old_saved = {}
+                for _, art in ipairs(self.articles) do
+                    if art.link then
+                        if art.read  then old_read[art.link]  = true end
+                        if art.saved then old_saved[art.link] = true end
+                    end
+                end
+                for _, art in ipairs(articles) do
+                    if old_read[art.link]  then art.read  = true end
+                    if old_saved[art.link] then art.saved = true end
+                end
+                -- Filter out dismissed articles (but keep saved ones)
+                local dismissed = Cache.loadDismissed()
+                if next(dismissed) then
+                    local kept = {}
+                    for _, art in ipairs(articles) do
+                        if art.saved or not (art.link and dismissed[art.link]) then
+                            table.insert(kept, art)
+                        end
+                    end
+                    articles = kept
+                end
+                Cache.saveArticles(articles)
                 self.articles = articles
                 self:_applyFilter()
 
@@ -468,17 +500,25 @@ function QuickRSSUI:_openMenu()
                     self:_openSettings()
                 end },
             },
-            -- Bottom row: destructive action + about
+            -- Destructive actions side by side
             {
-                { text = Icons.CLEAR .. "  " .. _("Clear Cache"), callback = function()
+                { text = Icons.CLEAR .. "  " .. _("Delete Read"), callback = function()
                     UIManager:close(dialog)
-                    self:_clearCache()
+                    self:_clearReadArticles()
                 end },
-                { text = Icons.INFO .. "  " .. _("About"), callback = function()
+                { text = Icons.CLEAR .. "  " .. _("Delete Saved"), callback = function()
                     UIManager:close(dialog)
-                    self:_openAbout()
+                    self:_deleteSavedArticles()
                 end },
             },
+            {{ text = Icons.CLEAR .. "  " .. _("Delete All Cache"), callback = function()
+                UIManager:close(dialog)
+                self:_clearCache()
+            end }},
+            {{ text = Icons.INFO .. "  " .. _("About"), callback = function()
+                UIManager:close(dialog)
+                self:_openAbout()
+            end }},
         },
     }
     UIManager:show(dialog)
@@ -491,16 +531,94 @@ function QuickRSSUI:_clearCache()
         text = _("Clear all cached articles and images?"),
         ok_text = _("Clear"),
         ok_callback = function()
-            Cache.clearCache()
-            self.articles    = {}
-            self.filtered    = nil
-            self.filter_feed = nil
-            self.show_page   = 1
-            self.filter_button:setText(
-                Icons.FILTER .. "  " .. _("All Feeds"),
-                self.filter_button.width)
-            self:_rebuildFooter()
-            self:_showStatus(_("Cache cleared.\nOpen the menu to fetch."))
+            local saved = Cache.clearCache()
+            self.articles      = saved
+            self.filtered      = nil
+            self.filter_feed   = nil
+            self.filter_unread = false
+            self.filter_saved  = false
+            self.show_page     = 1
+            self:_updateFilterButton()
+            if #saved > 0 then
+                self:_applyFilter()
+            else
+                self:_showStatus(_("Cache cleared.\nOpen the menu to fetch."))
+            end
+        end,
+    })
+end
+
+-- Remove all read articles from the cache and remember their links so
+-- they don't reappear on future fetches.
+function QuickRSSUI:_clearReadArticles()
+    local read_count = 0
+    for _, art in ipairs(self.articles) do
+        if art.read and not art.saved then read_count = read_count + 1 end
+    end
+    if read_count == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No read articles to clear."),
+        })
+        return
+    end
+
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Clear %1 read article(s)?\nThey won't reappear on future fetches."), read_count),
+        ok_text = _("Clear"),
+        ok_callback = function()
+            -- Add read article links to the dismissed set (skip saved articles)
+            local dismissed = Cache.loadDismissed()
+            local kept = {}
+            for _, art in ipairs(self.articles) do
+                if art.read and not art.saved and art.link then
+                    dismissed[art.link] = true
+                    if art.image_path then os.remove(art.image_path) end
+                else
+                    table.insert(kept, art)
+                end
+            end
+            Cache.saveDismissed(dismissed)
+            self.articles = kept
+            Cache.saveArticles(self.articles)
+            Cache.cleanOrphanedImages(self.articles)
+            self:_applyFilter()
+        end,
+    })
+end
+
+-- Remove all saved articles from the cache.
+function QuickRSSUI:_deleteSavedArticles()
+    local saved_count = 0
+    for _, art in ipairs(self.articles) do
+        if art.saved then saved_count = saved_count + 1 end
+    end
+    if saved_count == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No saved articles to delete."),
+        })
+        return
+    end
+
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Delete %1 saved article(s)?"), saved_count),
+        ok_text = _("Delete"),
+        ok_callback = function()
+            local kept = {}
+            for _, art in ipairs(self.articles) do
+                if art.saved then
+                    if art.image_path then os.remove(art.image_path) end
+                else
+                    table.insert(kept, art)
+                end
+            end
+            self.articles = kept
+            Cache.saveArticles(self.articles)
+            Cache.cleanOrphanedImages(self.articles)
+            self.filter_saved = false
+            self:_updateFilterButton()
+            self:_applyFilter()
         end,
     })
 end
@@ -539,39 +657,40 @@ function QuickRSSUI:_openAbout()
     })
 end
 
--- Apply all active filters (feed source, unread status, saved status) and rebuild the list.
-function QuickRSSUI:_applyFilter()
-    -- We will build a filtered subset if ANY filter is active
-    if self.filter_feed or self.filter_unread or self.filter_saved then
-        self.filtered = {}
-        for _, art in ipairs(self.articles) do
-            local match = true
-            
-            -- 1. Check feed source filter
-            if self.filter_feed and art.source ~= self.filter_feed then
-                match = false
-            end
-            
-            -- 2. Check unread filter (assumes unread articles have art.read == false or nil)
-            if self.filter_unread and art.read then
-                match = false
-            end
-            
-            -- 3. Check saved filter
-            if self.filter_saved and not art.saved then
-                match = false
-            end
-            
-            if match then
-                table.insert(self.filtered, art)
+-- Apply the current feed + unread filters and rebuild the displayed list.
+function QuickRSSUI:_applyFilter(keep_page)
+    local list = self.articles
+    if self.filter_feed then
+        local by_feed = {}
+        for _, art in ipairs(list) do
+            if art.source == self.filter_feed then
+                table.insert(by_feed, art)
             end
         end
-    else
-        -- No filters active, show everything
-        self.filtered = nil
+        list = by_feed
     end
-    
-    self.show_page = 1
+    if self.filter_unread then
+        local unread = {}
+        for _, art in ipairs(list) do
+            if not art.read then
+                table.insert(unread, art)
+            end
+        end
+        list = unread
+    end
+    if self.filter_saved then
+        local saved = {}
+        for _, art in ipairs(list) do
+            if art.saved then
+                table.insert(saved, art)
+            end
+        end
+        list = saved
+    end
+    self.filtered = (list ~= self.articles) and list or nil
+    if not keep_page then
+        self.show_page = 1
+    end
     self:_populateItems()
 end
 
@@ -653,6 +772,24 @@ function QuickRSSUI:_openFilterDialog()
     UIManager:show(dialog)
 end
 
+-- Update the filter button text to reflect current feed + unread state.
+function QuickRSSUI:_updateFilterButton()
+    local label = Icons.FILTER .. "  "
+    if self.filter_feed then
+        label = label .. self.filter_feed
+    else
+        label = label .. _("All Feeds")
+    end
+    local filters = {}
+    if self.filter_unread then table.insert(filters, _("Unread")) end
+    if self.filter_saved  then table.insert(filters, _("Saved"))  end
+    if #filters > 0 then
+        label = label .. " (" .. table.concat(filters, ", ") .. ")"
+    end
+    self.filter_button:setText(label)
+    self:_rebuildFooter()
+end
+
 -- Rebuild footer layout after filter button text changes.
 function QuickRSSUI:_rebuildFooter()
     local screen_w = Screen:getWidth()
@@ -667,6 +804,14 @@ function QuickRSSUI:_rebuildFooter()
     table.insert(self.footer_group, self.filter_button)
     table.insert(self.footer_group, HorizontalSpan:new{ width = spacer_w })
     table.insert(self.footer_group, self.page_nav)
+end
+
+-- Long-press context menu for a single article.
+function QuickRSSUI:_showArticleMenu(article)
+    local ArticleMenu = require("modules/ui/article_menu")
+    ArticleMenu.show(article, self.articles, function()
+        self:_applyFilter(true)
+    end)
 end
 
 -- Rebuild article_list for the current page and request a display refresh.
@@ -684,9 +829,14 @@ function QuickRSSUI:_populateItems()
     local start_idx   = (self.show_page - 1) * self.items_per_page + 1
     local end_idx     = math.min(start_idx + self.items_per_page - 1, total)
     local page_count  = end_idx - start_idx + 1
+    local sep_h       = Size.line.thin
     local content_h   = page_count * ITEM_HEIGHT
-                      + math.max(0, page_count - 1) * Size.line.thin
-    self.list_spacer.width = math.max(0, self.list_h - content_h)
+                      + math.max(0, page_count - 1) * sep_h
+    local remaining   = math.max(0, self.list_h - content_h)
+    local gap_count   = math.max(1, page_count - 1)
+    local gap         = (page_count > 1) and math.floor(remaining / gap_count) or 0
+    local extra_px    = (page_count > 1) and (remaining - gap * gap_count) or remaining
+    self.list_spacer.width = extra_px
 
     local art_settings = require("modules/data/config").getArticleSettings()
     for i = start_idx, end_idx do
@@ -697,70 +847,60 @@ function QuickRSSUI:_populateItems()
             art_settings = art_settings,
             -- Tap opens the article in the HTML reader.
             callback = function(article)
+                if not article.read then
+                    article.read = true
+                    Cache.saveArticles(self.articles)
+                    if self.filter_unread then
+                        self:_applyFilter(true)
+                    else
+                        self:_populateItems()
+                    end
+                end
                 local InfoMessage = require("ui/widget/infomessage")
                 local msg = InfoMessage:new{
                     text = _("Opening ") .. article.title,
                     timeout = 30,
                 }
                 UIManager:show(msg)
-                
-                -- Mark as read immediately when clicked
-                if not article.read then
-                    article.read = true
-                    -- Persist the read state to the cache file on disk
-                    Cache.saveArticles(self.articles)
-                end
-
                 UIManager:nextTick(function()
                     local ArticleReader = require("modules/ui/article_reader")
                     UIManager:show(ArticleReader:new{
                         article       = article,
                         articles      = articles,
                         article_index = i,
-                        -- If ArticleReader changes read/saved state inside, you can handle it on close:
-                        on_close = function()
-                            self:_applyFilter()
+                        on_close      = function()
+                            Cache.saveArticles(self.articles)
+                            if self.filter_unread then
+                                self:_applyFilter(true)
+                            else
+                                self:_populateItems()
+                            end
                         end,
                     })
                     UIManager:close(msg)
-                    
-                    -- Refresh the list context in case the active article should now be filtered out
-                    self:_applyFilter()
                 end)
             end,
-
             hold_callback = function(article)
-                local Notification = require("ui/widget/notification")
-                
-                -- Toggle bookmark/saved status
-                article.saved = not article.saved
-                
-                -- Persist state instantly to the on-disk cache file
-                Cache.saveArticles(self.articles)
-                
-                -- Display visual confirmation overlay
-                local status_txt = article.saved 
-                    and _("Article saved to bookmarks!") 
-                    or  _("Article removed from bookmarks.")
-                    
-                UIManager:show(Notification:new{
-                    text = status_txt,
-                })
-                
-                -- Re-evaluate view filters in case "Showing Saved Only" is toggled
-                self:_applyFilter()
-                return true
+                self:_showArticleMenu(article)
             end,
         }
         table.insert(self.article_list, item)
 
-        -- Thin grey separator between rows (omitted after the last item)
+        -- Dynamic-height separator between rows (omitted after the last item)
         if i < end_idx then
+            local pad_top    = math.floor(gap / 2)
+            local pad_bottom = gap - pad_top
+            if pad_top > 0 then
+                table.insert(self.article_list, VerticalSpan:new{ width = pad_top })
+            end
             table.insert(self.article_list, LineWidget:new{
                 background = require("ffi/blitbuffer").COLOR_LIGHT_GRAY,
-                dimen      = Geom:new{ w = self.item_width, h = Size.line.thin },
+                dimen      = Geom:new{ w = self.item_width, h = sep_h },
                 style      = "solid",
             })
+            if pad_bottom > 0 then
+                table.insert(self.article_list, VerticalSpan:new{ width = pad_bottom })
+            end
         end
     end
 
