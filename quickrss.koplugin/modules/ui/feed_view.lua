@@ -176,8 +176,15 @@ function QuickRSSUI:init()
     local label_area_w = max_label:getSize().w + PAD * 3
     max_label:free()
 
+    self.page_button = Button:new{
+        bordersize = 0,
+        callback = function() self:_goToPageInputDialog() end,
+        text = ">_",
+    }
+
     self.page_nav = HorizontalGroup:new{
         align = "center",
+        self.page_button,
         self.prev_button,
         CenterContainer:new{
             dimen = Geom:new{ w = label_area_w, h = btn_h },
@@ -812,6 +819,43 @@ function QuickRSSUI:_showArticleMenu(article)
     ArticleMenu.show(article, self.articles, function()
         self:_applyFilter(true)
     end)
+end
+
+-- Open a numeric popup dialog allowing input to jump directly to a page number.
+function QuickRSSUI:_goToPageInputDialog()
+    if not self.pages or self.pages <= 1 then return end
+
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Go to page"),
+        input = tostring(self.show_page),
+        input_type = "number",
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Go"),
+                    is_default = true,
+                    callback = function()
+                        local num = tonumber(dialog:getInputValue())
+                        if num and num >= 1 and num <= self.pages then
+                            self.show_page = num
+                            self:_populateItems()
+                        end
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
 end
 
 -- Rebuild article_list for the current page and request a display refresh.
